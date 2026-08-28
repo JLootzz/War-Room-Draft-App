@@ -10,8 +10,17 @@
  *   - If FANTASYPROS_API_KEY is set -> pull consensus tiers/ECR from FantasyPros.
  *   - Otherwise -> tiers are computed from ADP gaps (a sensible heuristic).
  *
- * Output: an array of { name, pos, team, ecr, tier, adp, bye } — exactly the
- * shape the app's "Load data" box and players.json expect.
+ * Scouting notes (optional):
+ *   - If ANTHROPIC_API_KEY is set -> generate a short plain-English note per
+ *     top player via Claude Haiku, baked into players.json (shown offline).
+ *
+ * Board rankings (optional, powers the app's "next pick per source"):
+ *   - ANTHROPIC_API_KEY -> Claude ranks the top players into its own board.
+ *   - OPENAI_API_KEY + OPENAI_MODEL -> ChatGPT does the same.
+ *     (Set OPENAI_MODEL to an id from your OpenAI dashboard, e.g. gpt-5.2.)
+ *
+ * Output: { name, pos, team, ecr, tier, adp, bye, injury, note, claudeRank,
+ *   gptRank } — exactly the shape the app expects.
  *
  * Requires Node 18+ (uses global fetch). No npm install needed.
  *
@@ -19,6 +28,9 @@
  *   node snapshot.mjs                                   # PPR, 12 teams, 2026
  *   node snapshot.mjs --scoring=half-ppr --teams=10
  *   FANTASYPROS_API_KEY=xxxx node snapshot.mjs          # better tiers
+ *   ANTHROPIC_API_KEY=xxxx  node snapshot.mjs           # + notes + Claude board
+ *   OPENAI_API_KEY=xxxx OPENAI_MODEL=gpt-5.2 node snapshot.mjs   # + ChatGPT board
+ *   node snapshot.mjs --no-notes --no-rank             # skip the LLM passes
  *   node snapshot.mjs --out=src/data/players.json
  */
 
@@ -30,8 +42,8 @@ import { fileURLToPath } from "node:url";
 function parseArgs(argv) {
   const a = {};
   argv.slice(2).forEach((s) => {
-    const m = s.match(/^--([^=]+)=(.*)$/);
-    if (m) a[m[1]] = m[2];
+    const m = s.match(/^--([^=]+)(?:=(.*))?$/);
+    if (m) a[m[1]] = m[2] ?? "true";
   });
   return a;
 }
@@ -41,6 +53,12 @@ const TEAMS = args.teams || "12";
 const SCORING = (args.scoring || "ppr").toLowerCase(); // ffc: standard | ppr | half-ppr | 2qb
 const OUT = args.out || "src/data/players.json";
 const FP_KEY = process.env.FANTASYPROS_API_KEY || "";
+const NOTES_LIMIT = Number(args.notes ?? 100);
+const MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001";
+const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || ""; // set to your account's model id, e.g. gpt-5.2
+const RANK_LIMIT = Number(args.rank ?? 120);
+const SCORING_LABEL = { ppr: "full PPR", "half-ppr": "half-PPR", standard: "standard (non-PPR)", "2qb": "2-QB / superflex" }[SCORING] || SCORING;
 
 // map FFC scoring -> FantasyPros scoring param
 const FP_SCORING = { ppr: "PPR", "half-ppr": "HALF", standard: "STD", "2qb": "PPR" }[SCORING] || "PPR";
@@ -153,6 +171,202 @@ async function getSleeperInjuries() {
   }
 }
 
+/**
+ * Optional: generate a short scouting note per top player via Claude Haiku.
+ * Runs locally in Node, so the API key stays on your machine (never shipped to
+ * the browser). Notes are baked into players.json and shown offline in the app.
+ * Grounded in the tier/ADP/bye/injury data — the model is told not to invent
+ * stats or injury news. Mutates players in place (sets p.note).
+ */
+async function generateNotes(players) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) { console.log("→ Notes: skipped (set ANTHROPIC_API_KEY to enable)."); return 0; }
+  if (args["no-notes"]) { console.log("→ Notes: skipped (--no-notes)."); return 0; }
+
+  const top = [...players].sort((a, b) => a.ecr - b.ecr).slice(0, NOTES_LIMIT);
+  const BATCH = 20;
+  let done = 0;
+  console.log(`→ Notes: generating for top ${top.length} players via ${MODEL} ...`);
+
+  const system =
+    "You are a concise fantasy football draft analyst. For each player, write ONE note of 25-45 words: " +
+    "first a brief outlook on their role and fantasy value, then a practical draft-day tip (when to target them, or a caution). " +
+    `Scoring is ${SCORING_LABEL}. Base every note on general football knowledge plus the provided tier / ADP / bye / injury fields. ` +
+    "Do NOT invent specific statistics, yardage, contract details, or injury news. " +
+    "If an injury code is given, note it as a caution; if injury is 'none', do not speculate about health. " +
+    "Return ONLY a JSON object mapping each exact player name to its note string — no markdown, no commentary.";
+
+  for (let i = 0; i < top.length; i += BATCH) {
+    const batch = top.slice(i, i + BATCH);
+    const roster = batch.map((p) => ({
+      name: p.name, pos: p.pos, team: p.team, tier: p.tier, adp: p.adp, bye: p.bye, injury: p.injury || "none",
+    }));
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: MODEL,
+          max_tokens: 2000,
+          system,
+          messages: [{ role: "user", content: "Players:\n" + JSON.stringify(roster) }],
+        }),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        console.warn(`  ! notes batch ${i / BATCH + 1}: HTTP ${res.status} ${detail.slice(0, 120)}`);
+        continue;
+      }
+      const data = await res.json();
+      let text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+      text = text.replace(/^```(?:json)?\s*/i, "").replace(/```$/, "").trim();
+      const notes = JSON.parse(text);
+      const byName = new Map(Object.entries(notes).map(([k, v]) => [normName(k), v]));
+      batch.forEach((p) => { const n = byName.get(normName(p.name)); if (n) { p.note = String(n); done++; } });
+    } catch (e) {
+      console.warn(`  ! notes batch ${i / BATCH + 1} failed (${e.message}) — skipping.`);
+    }
+  }
+  console.log(`  ${done} notes written.`);
+  return done;
+}
+
+/**
+ * Optional: ask a model to rank the top players into its own draft board.
+ * Grounded in the provided data; the model must reuse only the given names.
+ * Returns Map<normName, rank>. Used to show "next pick per source" in the app.
+ */
+function parseJsonArray(text) {
+  let t = String(text).trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/, "").trim();
+  const s = t.indexOf("["), e = t.lastIndexOf("]");
+  if (s !== -1 && e !== -1) t = t.slice(s, e + 1);
+  const parsed = JSON.parse(t);
+  return Array.isArray(parsed) ? parsed : (parsed.ranking || parsed.players || parsed.order || []);
+}
+
+async function rankBoard(provider, players) {
+  const top = [...players].sort((a, b) => a.ecr - b.ecr).slice(0, RANK_LIMIT);
+  const roster = top.map((p) => ({
+    name: p.name, pos: p.pos, team: p.team, tier: p.tier, adp: p.adp, bye: p.bye, injury: p.injury || "none",
+  }));
+  const system =
+    `You are an expert fantasy football draft analyst. Rank these players for a ${TEAMS}-team ${SCORING_LABEL} ` +
+    "league in the order YOU would draft them, best first. Use ONLY the players provided; include every one exactly once; " +
+    "never add or invent players. Ground the ranking in the provided tier / ADP / bye / injury fields plus general football " +
+    "knowledge; do not fabricate stats or injury news. Return ONLY a JSON array of the exact player-name strings, in order.";
+  const user = "Players:\n" + JSON.stringify(roster);
+
+  let text;
+  if (provider === "anthropic") {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      body: JSON.stringify({ model: MODEL, max_tokens: 4000, system, messages: [{ role: "user", content: user }] }),
+    });
+    if (!res.ok) throw new Error(`Claude HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 140)}`);
+    const data = await res.json();
+    text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+  } else {
+    // OpenAI GPT-5-series: chat/completions, Bearer auth, max_completion_tokens, no temperature
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${OPENAI_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        max_completion_tokens: 4000,
+        messages: [{ role: "system", content: system }, { role: "user", content: user }],
+      }),
+    });
+    if (!res.ok) throw new Error(`OpenAI HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 140)}`);
+    const data = await res.json();
+    text = data.choices?.[0]?.message?.content || "";
+  }
+
+  const order = parseJsonArray(text);
+  const rank = new Map();
+  order.forEach((name, i) => { const k = normName(name); if (k && !rank.has(k)) rank.set(k, i + 1); });
+  return rank;
+}
+
+async function askTakes(provider, players) {
+  const top = [...players].sort((a, b) => a.ecr - b.ecr).slice(0, RANK_LIMIT);
+  const roster = top.map((p) => ({ name: p.name, pos: p.pos, team: p.team, tier: p.tier, adp: p.adp, bye: p.bye, injury: p.injury || "none" }));
+  const system =
+    `You are a fantasy football analyst giving contrarian draft takes for a ${TEAMS}-team ${SCORING_LABEL} league. ` +
+    "From the players provided, choose the SIX you feel most differently about versus their ADP. For each, write a one-sentence take " +
+    "that STARTS with 'BUY' (you'd draft them earlier than ADP) or 'FADE' (let them slide), then a brief reason grounded in role or situation. " +
+    "Do NOT invent specific stats or injury news; if unsure about a player, choose a different one. " +
+    "Return ONLY a JSON object mapping the exact player name to the take string. At most 6 entries.";
+  const user = "Players:\n" + JSON.stringify(roster);
+  let text;
+  if (provider === "anthropic") {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      body: JSON.stringify({ model: MODEL, max_tokens: 1200, system, messages: [{ role: "user", content: user }] }),
+    });
+    if (!res.ok) throw new Error(`Claude HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 140)}`);
+    const data = await res.json();
+    text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+  } else {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${OPENAI_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: OPENAI_MODEL, max_completion_tokens: 1200, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
+    });
+    if (!res.ok) throw new Error(`OpenAI HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 140)}`);
+    const data = await res.json();
+    text = data.choices?.[0]?.message?.content || "";
+  }
+  let t = String(text).trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/, "").trim();
+  const s = t.indexOf("{"), e = t.lastIndexOf("}");
+  if (s !== -1 && e !== -1) t = t.slice(s, e + 1);
+  const obj = JSON.parse(t);
+  const m = new Map();
+  Object.entries(obj).forEach(([k, v]) => { const kk = normName(k); if (kk) m.set(kk, String(v)); });
+  return m;
+}
+
+async function addRankings(players) {
+  if (args["no-rank"]) return { claude: 0, gpt: 0, claudeTakes: 0, gptTakes: 0 };
+  const out = { claude: 0, gpt: 0, claudeTakes: 0, gptTakes: 0 };
+
+  if (process.env.ANTHROPIC_API_KEY) {
+    try {
+      console.log(`→ Claude board ranking (top ${RANK_LIMIT}) via ${MODEL} ...`);
+      const r = await rankBoard("anthropic", players);
+      players.forEach((p) => { const x = r.get(normName(p.name)); if (x) { p.claudeRank = x; out.claude++; } });
+      console.log(`  ${out.claude} players ranked by Claude.`);
+    } catch (e) { console.warn(`  ! Claude ranking failed (${e.message}).`); }
+    try {
+      console.log("→ Claude hot takes ...");
+      const t = await askTakes("anthropic", players);
+      players.forEach((p) => { const x = t.get(normName(p.name)); if (x) { p.claudeTake = x; out.claudeTakes++; } });
+      console.log(`  ${out.claudeTakes} Claude hot takes.`);
+    } catch (e) { console.warn(`  ! Claude hot takes failed (${e.message}).`); }
+  }
+
+  if (OPENAI_KEY) {
+    if (!OPENAI_MODEL) {
+      console.log("→ ChatGPT ranking: skipped (set OPENAI_MODEL to a model id from your OpenAI dashboard).");
+    } else {
+      try {
+        console.log(`→ ChatGPT board ranking (top ${RANK_LIMIT}) via ${OPENAI_MODEL} ...`);
+        const r = await rankBoard("openai", players);
+        players.forEach((p) => { const x = r.get(normName(p.name)); if (x) { p.gptRank = x; out.gpt++; } });
+        console.log(`  ${out.gpt} players ranked by ChatGPT.`);
+      } catch (e) { console.warn(`  ! ChatGPT ranking failed (${e.message}). Check OPENAI_MODEL matches your account.`); }
+      try {
+        console.log("→ ChatGPT hot takes ...");
+        const t = await askTakes("openai", players);
+        players.forEach((p) => { const x = t.get(normName(p.name)); if (x) { p.gptTake = x; out.gptTakes++; } });
+        console.log(`  ${out.gptTakes} ChatGPT hot takes.`);
+      } catch (e) { console.warn(`  ! ChatGPT hot takes failed (${e.message}).`); }
+    }
+  }
+  return out;
+}
+
 /* ------------------------------ main ------------------------------ */
 async function main() {
   const base = await getFFC();
@@ -189,10 +403,15 @@ async function main() {
     if (p.injury) flagged++;
   });
 
+  const noteCount = await generateNotes(base);
+  const ranks = await addRankings(base);
+
   const players = base
     .sort((a, b) => a.ecr - b.ecr)
-    .map(({ name, pos, team, ecr, tier, adp, bye, injury }) => ({
+    .map(({ name, pos, team, ecr, tier, adp, bye, injury, note, claudeRank, gptRank, claudeTake, gptTake }) => ({
       name, pos, team, ecr, tier, adp: Math.round(adp * 10) / 10, bye, injury,
+      note: note || "", claudeRank: claudeRank || null, gptRank: gptRank || null,
+      claudeTake: claudeTake || "", gptTake: gptTake || "",
     }));
 
   await mkdir(dirname(OUT) === "" ? "." : dirname(OUT), { recursive: true });
@@ -204,10 +423,15 @@ async function main() {
   console.log("  Scoring:", SCORING, "| Teams:", TEAMS, "| Year:", YEAR);
   console.log("  Tiers:", tierSource);
   console.log("  Injuries flagged:", flagged);
+  console.log("  Scouting notes:", noteCount);
+  console.log("  Board rankings:", `Claude ${ranks.claude}, ChatGPT ${ranks.gpt}`);
+  console.log("  Hot takes:", `Claude ${ranks.claudeTakes}, ChatGPT ${ranks.gptTakes}`);
   console.log("  By position:", counts);
   console.log("  Top 5:", players.slice(0, 5).map((p) => `${p.name} (${p.pos}, adp ${p.adp})`).join(", "));
   console.log("\n  Data: ADP via Fantasy Football Calculator" +
-    (fp ? " · tiers via FantasyPros" : "") + (inj ? " · injuries via Sleeper" : "") + ".");
+    (fp ? " · tiers via FantasyPros" : "") + (inj ? " · injuries via Sleeper" : "") +
+    (noteCount ? " · notes via Claude" : "") +
+    (ranks.claude ? " · Claude board" : "") + (ranks.gpt ? " · ChatGPT board" : "") + ".");
 }
 
 const isMain = process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url);

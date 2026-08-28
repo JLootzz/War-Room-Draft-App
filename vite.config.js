@@ -9,8 +9,8 @@ export default defineConfig({
       registerType: "autoUpdate",
       includeAssets: ["favicon.svg"],
       manifest: {
-        name: "Draft War Room",
-        short_name: "War Room",
+        name: "Lake Ariel FFL War Room",
+        short_name: "Lake Ariel",
         description: "Fantasy football draft assistant",
         theme_color: "#0c1512",
         background_color: "#0c1512",

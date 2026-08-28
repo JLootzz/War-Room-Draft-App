@@ -104,6 +104,11 @@ function prepPool(list) {
         adp: Number(p.adp ?? p.ecr ?? i + 1),
         bye: Number(p.bye ?? 0),
         injury: p.injury || "",
+        note: p.note || "",
+        claudeRank: p.claudeRank ?? null,
+        gptRank: p.gptRank ?? null,
+        claudeTake: p.claudeTake || "",
+        gptTake: p.gptTake || "",
         posrank: c[pos],
       };
     });
@@ -113,14 +118,14 @@ function prepPool(list) {
 const INITIAL_POOL = Array.isArray(DATA) && DATA.length ? prepPool(DATA) : SEED;
 
 // ---- persistence (survives refresh / phone-lock during a live draft) ----
-const LS_KEY = "dwr-state-v1";
+const LS_KEY = "dwr-state-v2";
 function loadState() {
   try { return JSON.parse(localStorage.getItem(LS_KEY)) || {}; }
   catch { return {}; }
 }
 
-const POS = ["ALL", "QB", "RB", "WR", "TE"];
-const POS_COLOR = { QB: "#e0709a", RB: "#47c2c7", WR: "#7c8cf0", TE: "#e0a33c" };
+const POS = ["ALL", "QB", "RB", "WR", "TE", "DST", "K"];
+const POS_COLOR = { QB: "#e0709a", RB: "#47c2c7", WR: "#7c8cf0", TE: "#e0a33c", DST: "#8a94a6", K: "#c98b5a" };
 const STARTERS = [
   { slot: "QB", accepts: ["QB"] },
   { slot: "RB", accepts: ["RB"] },
@@ -129,6 +134,8 @@ const STARTERS = [
   { slot: "WR", accepts: ["WR"] },
   { slot: "TE", accepts: ["TE"] },
   { slot: "FLEX", accepts: ["RB", "WR", "TE"] },
+  { slot: "K", accepts: ["K"] },
+  { slot: "DST", accepts: ["DST"] },
 ];
 
 function onClock(pick, teams) {
@@ -151,24 +158,32 @@ function assignRoster(myPlayers) {
 
 export default function DraftWarRoom() {
   const boot = loadState();
-  const [players, setPlayers] = useState(boot.players?.length ? boot.players : INITIAL_POOL);
+  const [players, setPlayers] = useState(boot.pool?.length ? boot.pool : INITIAL_POOL);
+  const [poolImported, setPoolImported] = useState(Boolean(boot.pool?.length));
   const [log, setLog] = useState(boot.log || []); // {id, by:'me'|'other', pick}
-  const [teams, setTeams] = useState(boot.teams || 12);
+  const [teams, setTeams] = useState(boot.teams || 10);
   const [mySlot, setMySlot] = useState(boot.mySlot || 1);
-  const [scoring, setScoring] = useState(boot.scoring || "PPR");
+  const [scoring, setScoring] = useState(boot.scoring || "Half");
   const [posFilter, setPosFilter] = useState("ALL");
   const [sortBy, setSortBy] = useState("rank");
   const [query, setQuery] = useState("");
+  const [expandedId, setExpandedId] = useState(null);
   const [showImport, setShowImport] = useState(false);
   const [importText, setImportText] = useState("");
   const [importErr, setImportErr] = useState("");
 
-  // autosave everything so a refresh or phone-lock never wipes the board
+  // autosave draft state so a refresh or phone-lock never wipes the board.
+  // The player pool is NOT cached here (it comes fresh from players.json each
+  // load) — except when you explicitly import one via "Load data", so a phone
+  // import survives a refresh.
   useEffect(() => {
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify({ players, log, teams, mySlot, scoring }));
+      localStorage.setItem(LS_KEY, JSON.stringify({
+        log, teams, mySlot, scoring,
+        ...(poolImported ? { pool: players } : {}),
+      }));
     } catch { /* storage full or unavailable — draft still works in memory */ }
-  }, [players, log, teams, mySlot, scoring]);
+  }, [players, poolImported, log, teams, mySlot, scoring]);
 
   const draftedIds = useMemo(() => new Set(log.map((l) => l.id)), [log]);
   const byId = useMemo(() => Object.fromEntries(players.map((p) => [p.id, p])), [players]);
@@ -194,6 +209,70 @@ export default function DraftWarRoom() {
     () => [...valued].sort((a, b) => b.delta - a.delta).find((p) => p.delta >= 3),
     [valued]
   );
+
+  // "council" — the top available player per source (ADP / Claude / ChatGPT)
+  const councilClaude = useMemo(
+    () => available.filter((p) => p.claudeRank).sort((a, b) => a.claudeRank - b.claudeRank)[0],
+    [available]
+  );
+  const councilGpt = useMemo(
+    () => available.filter((p) => p.gptRank).sort((a, b) => a.gptRank - b.gptRank)[0],
+    [available]
+  );
+  const hasCouncil = Boolean(councilClaude || councilGpt);
+  const councilConsensus = useMemo(() => {
+    const ids = [recByRank, councilClaude, councilGpt].filter(Boolean).map((p) => p.id);
+    return ids.length > 1 && ids.every((id) => id === ids[0]);
+  }, [recByRank, councilClaude, councilGpt]);
+
+  // needs-aware recommendation: best available, leaning toward unfilled starter
+  // slots as your roster fills (K/DST suppressed until skill starters are done)
+  const myCounts = useMemo(() => {
+    const c = { QB: 0, RB: 0, WR: 0, TE: 0, K: 0, DST: 0 };
+    log.filter((l) => l.by === "me").forEach((l) => {
+      const p = byId[l.id];
+      if (p && c[p.pos] != null) c[p.pos] += 1;
+    });
+    return c;
+  }, [log, byId]);
+
+  const recInfo = useMemo(() => {
+    if (!available.length) return { player: null, reason: "" };
+    const c = myCounts;
+    const flexFilled = (Math.max(0, c.RB - 2) + Math.max(0, c.WR - 2) + Math.max(0, c.TE - 1)) >= 1;
+    const skillFilled = c.QB >= 1 && c.RB >= 2 && c.WR >= 2 && c.TE >= 1 && flexFilled;
+    const filled = Math.min(1, c.QB) + Math.min(2, c.RB) + Math.min(2, c.WR) + Math.min(1, c.TE) + (flexFilled ? 1 : 0) + Math.min(1, c.K) + Math.min(1, c.DST);
+    const fillFrac = Math.min(1, filled / 9);
+    const target = { QB: 1, RB: 2, WR: 2, TE: 1, K: 1, DST: 1 };
+    const isNeed = (pos) => {
+      if (pos === "QB") return c.QB < 1;
+      if (pos === "TE") return c.TE < 1 || !flexFilled;
+      if (pos === "RB") return c.RB < 2 || !flexFilled;
+      if (pos === "WR") return c.WR < 2 || !flexFilled;
+      if (pos === "K") return skillFilled && c.K < 1;
+      if (pos === "DST") return skillFilled && c.DST < 1;
+      return false;
+    };
+    const NEED = 15, DEPTH = 10;
+    const eff = (p) => {
+      let r = p.ecr;
+      if (p.pos === "K" || p.pos === "DST") {
+        if (!skillFilled) return r + 500;      // don't surface before the last rounds
+        return c[p.pos] < 1 ? r - 12 : r + 40; // then push the one you still need
+      }
+      if (isNeed(p.pos)) r -= NEED * fillFrac;
+      else r += DEPTH * Math.max(0, (c[p.pos] || 0) - target[p.pos]) * fillFrac;
+      return r;
+    };
+    const player = [...available].map((p) => ({ p, e: eff(p) })).sort((a, b) => a.e - b.e)[0].p;
+    let reason = "best available";
+    const diff = recByRank && player.id !== recByRank.id;
+    if ((player.pos === "K" || player.pos === "DST") && skillFilled) reason = `lock in your ${player.pos}`;
+    else if (isNeed(player.pos) && fillFrac >= 0.3 && diff) reason = `fills your ${player.pos} need`;
+    else if (isNeed(player.pos) && diff) reason = `${player.pos} need`;
+    return { player, reason };
+  }, [available, myCounts, recByRank]);
+  const recommended = recInfo.player;
 
   // tier scarcity: for each pos, the current (lowest) tier still on the board
   const tierAlerts = useMemo(() => {
@@ -272,12 +351,18 @@ export default function DraftWarRoom() {
         adp: Number(r.adp ?? r.ecr ?? i + 1),
         bye: Number(r.bye ?? 0),
         injury: r.injury || r.injury_status || "",
+        note: r.note || "",
+        claudeRank: r.claudeRank ?? null,
+        gptRank: r.gptRank ?? null,
+        claudeTake: r.claudeTake || "",
+        gptTake: r.gptTake || "",
         posrank: 0,
       })).filter((p) => p.name && p.pos);
       if (!norm.length) throw new Error("No valid rows found.");
       const c = {};
       norm.sort((a, b) => a.ecr - b.ecr).forEach((p) => { c[p.pos] = (c[p.pos] || 0) + 1; p.posrank = c[p.pos]; });
       setPlayers(norm);
+      setPoolImported(true);
       setLog([]);
       setShowImport(false);
       setImportText("");
@@ -286,9 +371,10 @@ export default function DraftWarRoom() {
     }
   };
 
+  const r1 = (n) => Math.round(n * 10) / 10;
   const valuePill = (delta) => {
-    if (delta >= 3) return <span className="pill go">▼ {delta} value</span>;
-    if (delta <= -6) return <span className="pill cold">▲ {-delta} early</span>;
+    if (delta >= 3) return <span className="pill go">▼ {r1(delta)} value</span>;
+    if (delta <= -6) return <span className="pill cold">▲ {r1(-delta)} early</span>;
     return <span className="pill neutral">≈ adp</span>;
   };
 
@@ -298,9 +384,11 @@ export default function DraftWarRoom() {
 
       <header className="topbar">
         <div className="brand">
-          <span className="mark">◆</span>
-          <span className="brandname">WAR ROOM</span>
-          <span className="brandsub">draft assistant · prototype</span>
+          <img className="brandlogo" src="/league-logo.png" alt="Lake Ariel Fantasy Football League" />
+          <div className="brandtext">
+            <span className="brandname">LAKE ARIEL</span>
+            <span className="brandsub">Fantasy Football League · War Room</span>
+          </div>
         </div>
         <div className="settings">
           <label>Teams
@@ -331,23 +419,47 @@ export default function DraftWarRoom() {
             {available.length === 0 ? "Draft complete" : isMyPick ? "You're on the clock" : `Team ${clock.slot} on the clock`}
           </span>
         </div>
-        {recByRank ? (
+        {recommended ? (
           <div className="clock-rec">
             <div className="rec-primary">
               <span className="rec-verb">Take</span>
-              <span className="rec-name">{recByRank.name}</span>
-              <span className="rec-tag" style={{ color: POS_COLOR[recByRank.pos] }}>
-                {recByRank.pos}{recByRank.posrank} · tier {recByRank.tier}
+              <span className="rec-name">{recommended.name}</span>
+              <span className="rec-tag" style={{ color: POS_COLOR[recommended.pos] }}>
+                {recommended.pos}{recommended.posrank} · tier {recommended.tier}
               </span>
+              {recInfo.reason && recInfo.reason !== "best available" && (
+                <span className="rec-need">{recInfo.reason}</span>
+              )}
             </div>
             <div className="rec-value">
               {bestValue
-                ? <>best value on board: <b>{bestValue.name}</b> <span className="go">▼ {bestValue.delta} past ADP</span></>
+                ? <>best value on board: <b>{bestValue.name}</b> <span className="go">▼ {r1(bestValue.delta)} past ADP</span></>
                 : <span className="muted">values appear as players fall past their ADP</span>}
             </div>
+            {recommended.note && <div className="rec-note">{recommended.note}</div>}
           </div>
         ) : <div className="clock-rec"><span className="muted">Board is empty.</span></div>}
       </section>
+
+      {hasCouncil && recByRank && (
+        <section className="council">
+          <div className="council-head">
+            <span className="council-label">Next pick, by source</span>
+            {councilConsensus && <span className="council-agree">all agree</span>}
+          </div>
+          <div className="council-chips">
+            {[["ADP", recByRank], ["Claude", councilClaude], ["ChatGPT", councilGpt]]
+              .filter(([, p]) => p)
+              .map(([src, p]) => (
+                <button key={src} className="cchip" onClick={() => draft(p.id, "me")} title={`Draft ${p.name}`}>
+                  <span className="csrc">{src}</span>
+                  <span className="cname">{p.name}{p.injury && <span className="inj">{p.injury}</span>}</span>
+                  <span className="cpos" style={{ color: POS_COLOR[p.pos] }}>{p.pos}{p.posrank} · adp {p.adp}</span>
+                </button>
+              ))}
+          </div>
+        </section>
+      )}
 
       <div className="grid">
         {/* LEFT: alerts */}
@@ -376,7 +488,7 @@ export default function DraftWarRoom() {
           {valued.filter((p) => p.delta >= 3).sort((a, b) => b.delta - a.delta).slice(0, 5).map((p) => (
             <button key={p.id} className="valrow" onClick={() => draft(p.id, "me")}>
               <span className="vn">{p.name}</span>
-              <span className="go">▼ {p.delta}</span>
+              <span className="go">▼ {r1(p.delta)}</span>
             </button>
           ))}
           {valued.filter((p) => p.delta >= 3).length === 0 && (
@@ -407,19 +519,38 @@ export default function DraftWarRoom() {
 
           <div className="rows">
             {shown.map((p) => (
-              <div key={p.id} className={"prow" + (recByRank && p.id === recByRank.id ? " rec" : "")}>
+              <React.Fragment key={p.id}>
+              <div className={"prow" + (recommended && p.id === recommended.id ? " rec" : "")}>
                 <span className="rk">{p.ecr}</span>
                 <span className="pbadge" style={{ background: POS_COLOR[p.pos] }}>{p.pos}</span>
-                <span className="pmain">
-                  <span className="pname">{p.name}{p.injury && <span className="inj">{p.injury}</span>}{recByRank && p.id === recByRank.id && <Star size={12} className="recstar" />}</span>
-                  <span className="pmeta">{p.team} · {p.pos}{p.posrank} · tier {p.tier} · bye {p.bye}</span>
-                </span>
+                {(() => {
+                  const hasDetail = p.note || p.claudeTake || p.gptTake;
+                  return (
+                    <span
+                      className={"pmain" + (hasDetail ? " tappable" : "")}
+                      onClick={() => hasDetail && setExpandedId(expandedId === p.id ? null : p.id)}
+                      role={hasDetail ? "button" : undefined}
+                      tabIndex={hasDetail ? 0 : undefined}
+                    >
+                      <span className="pname">{p.name}{p.injury && <span className="inj">{p.injury}</span>}{p.note && <span className="notedot">i</span>}{(p.claudeTake || p.gptTake) && <Flame size={11} className="takedot" />}{recommended && p.id === recommended.id && <Star size={12} className="recstar" />}</span>
+                      <span className="pmeta">{p.team} · {p.pos}{p.posrank} · tier {p.tier} · bye {p.bye}</span>
+                    </span>
+                  );
+                })()}
                 <span className="padp">{valuePill(p.delta)}<span className="adpn">adp {p.adp}</span></span>
                 <span className="pacts">
                   <button className="mine" onClick={() => draft(p.id, "me")}>Mine</button>
                   <button className="gone" onClick={() => draft(p.id, "other")}>Gone</button>
                 </span>
               </div>
+              {expandedId === p.id && (p.note || p.claudeTake || p.gptTake) && (
+                <div className="noterow">
+                  {p.note && <div className="note-line">{p.note}</div>}
+                  {p.claudeTake && <div className="take-line"><span className="take-src">Claude</span> {p.claudeTake}</div>}
+                  {p.gptTake && <div className="take-line"><span className="take-src gpt">ChatGPT</span> {p.gptTake}</div>}
+                </div>
+              )}
+              </React.Fragment>
             ))}
             {shown.length === 0 && <div className="empty-note pad">No players match. Clear the search or switch positions.</div>}
           </div>
@@ -508,10 +639,12 @@ const CSS = `
 
 /* header */
 .topbar{display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:12px}
-.brand{display:flex; align-items:baseline; gap:8px}
+.brand{display:flex; align-items:center; gap:12px}
+.brandlogo{height:52px; width:auto; display:block; filter:drop-shadow(0 2px 6px rgba(0,0,0,.5))}
+.brandtext{display:flex; flex-direction:column; line-height:1.15}
 .mark{color:var(--go); font-size:15px}
-.brandname{font-weight:700; letter-spacing:.14em; font-size:19px}
-.brandsub{color:var(--dim); font-size:11px; letter-spacing:.04em}
+.brandname{font-family:'Oswald','Inter',sans-serif; font-weight:700; letter-spacing:.13em; font-size:22px}
+.brandsub{color:var(--dim); font-size:10.5px; letter-spacing:.05em}
 .settings{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
 .settings label{display:flex; flex-direction:column; font-size:9px; letter-spacing:.12em; text-transform:uppercase; color:var(--dim); gap:3px}
 .settings select{background:var(--panel2); color:var(--chalk); border:1px solid var(--line); border-radius:6px; padding:5px 7px; font-family:inherit; font-size:13px}
@@ -540,6 +673,7 @@ const CSS = `
 .rec-verb{font-size:11px; letter-spacing:.2em; text-transform:uppercase; color:var(--dim)}
 .rec-name{font-size:20px; font-weight:600}
 .rec-tag{font-size:12px; font-weight:600}
+.rec-need{font-size:9.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--flag); border:1px solid rgba(242,180,65,.5); border-radius:20px; padding:2px 8px}
 .rec-value{font-size:12px; color:var(--dim)}
 .rec-value b{color:var(--chalk); font-weight:600}
 
@@ -568,7 +702,7 @@ const CSS = `
 
 /* board */
 .board-head{display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap}
-.tabs{display:flex; gap:4px}
+.tabs{display:flex; gap:4px; flex-wrap:wrap}
 .tab{background:var(--panel2); border:1px solid var(--line); color:var(--dim); border-radius:6px; padding:5px 11px; font-size:12px; font-weight:600; letter-spacing:.03em}
 .tab.on{color:var(--field); background:var(--chalk); border-color:var(--chalk)}
 .board-tools{display:flex; gap:8px; align-items:center}
@@ -590,6 +724,27 @@ const CSS = `
 .pname{font-size:14px; font-weight:600; display:flex; align-items:center; gap:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 .recstar{color:var(--go)}
 .inj{font-size:8.5px; font-weight:700; letter-spacing:.03em; color:var(--cold); border:1px solid rgba(255,107,87,.5); border-radius:3px; padding:0 3px; line-height:1.4}
+.pmain.tappable{cursor:pointer}
+.notedot{display:inline-flex; align-items:center; justify-content:center; width:13px; height:13px; border-radius:50%; font-size:9px; font-weight:700; font-style:italic; color:var(--field); background:var(--dim); font-family:Georgia,serif}
+.noterow{grid-column:1 / -1; font-size:11.5px; line-height:1.5; color:var(--dim); background:var(--panel2); border-left:2px solid var(--go); border-radius:0 6px 6px 0; padding:8px 12px; margin:0 0 6px 40px; display:flex; flex-direction:column; gap:5px}
+.note-line{color:var(--dim)}
+.take-line{color:var(--chalk); opacity:.9}
+.take-src{font-family:'Oswald',sans-serif; font-size:9px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:var(--field); background:#7c8cf0; border-radius:3px; padding:1px 5px; margin-right:6px}
+.take-src.gpt{background:#3ed598}
+.takedot{color:var(--flag); margin-left:1px}
+.rec-note{font-size:11.5px; line-height:1.45; color:var(--chalk); opacity:.82; margin-top:5px; max-width:52ch}
+
+/* council: next pick per source */
+.council{border:1px solid var(--line); border-radius:10px; padding:10px 14px; margin-bottom:12px; background:var(--panel)}
+.council-head{display:flex; align-items:center; gap:10px; margin-bottom:8px}
+.council-label{font-size:10px; letter-spacing:.16em; text-transform:uppercase; color:var(--dim)}
+.council-agree{font-size:9px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:var(--field); background:var(--go); border-radius:20px; padding:2px 8px}
+.council-chips{display:flex; gap:8px; flex-wrap:wrap}
+.cchip{flex:1; min-width:150px; display:flex; flex-direction:column; gap:2px; align-items:flex-start; text-align:left; background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:8px 11px; color:var(--chalk)}
+.cchip:hover{border-color:var(--go)}
+.csrc{font-family:'Oswald',sans-serif; font-size:9.5px; font-weight:600; letter-spacing:.12em; text-transform:uppercase; color:var(--dim)}
+.cname{font-size:14px; font-weight:600; display:flex; align-items:center; gap:5px}
+.cpos{font-size:10.5px; font-weight:600}
 .pmeta{font-size:10.5px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 .padp{display:flex; flex-direction:column; align-items:flex-end; gap:2px}
 .pill{font-size:10px; font-weight:600; padding:2px 7px; border-radius:20px; white-space:nowrap}
